@@ -64,7 +64,27 @@ def audit_reviews_anomalies() -> None:
     print(f"  - Extra rows per order (1:N)   : {duplicate_order_rows:,} duplicate rows")
 
 
+def audit_geolocation_anomalies() -> None:
+    df = pd.read_csv(BRONZE_DIR / "olist_geolocation_dataset.csv")
+    
+    total_rows = len(df)
+    unique_zips = df["geolocation_zip_code_prefix"].nunique()
+    
+    # Bounding box for Brazil (rough limits)
+    # Latitude: roughly -34.0 to 5.3 | Longitude: roughly -74.0 to -32.0
+    invalid_lat = ((df["geolocation_lat"] < -34.0) | (df["geolocation_lat"] > 5.3)).sum()
+    invalid_lng = ((df["geolocation_lng"] < -74.0) | (df["geolocation_lng"] > -32.0)).sum()
+
+    print("\n=== 4. GEOLOCATION ANOMALIES AUDIT ===")
+    print(f"  - Total rows in bronze         : {total_rows:,}")
+    print(f"  - Unique ZIP code prefixes     : {unique_zips:,}")
+    print(f"  - Duplicate rows (compressible): {total_rows - unique_zips:,}")
+    print(f"  - Invalid Latitude (outside BR): {invalid_lat:,}")
+    print(f"  - Invalid Longitude (outside BR): {invalid_lng:,}")
+
+    
 if __name__ == "__main__":
     audit_orders_anomalies()
     audit_products_anomalies()
     audit_reviews_anomalies()
+    audit_geolocation_anomalies()
