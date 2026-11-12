@@ -1,0 +1,21 @@
+# Virtual environment & Python cache
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Environment variables & secrets (API Keys)
+.env
+
+# macOS system files
+.DS_Store
+
+# Data files (never commit raw CSVs, Parquet, or DuckDB binaries to Git!)
+data/bronze/*
+!data/bronze/.gitkeep
+
+data/silver/*
+!data/silver/.gitkeep
+
+data/gold/*
+!data/gold/.gitkeep
