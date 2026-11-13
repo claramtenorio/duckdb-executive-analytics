@@ -1,153 +1,347 @@
-# Olist Medallion Lakehouse & Executive Analytics (DuckDB OLAP)
+from pathlib import Path
+import duckdb
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
 
-[![Live Executive Dashboard](https://img.shields.io/badge/🔴_Live_Demo-Streamlit_Cloud-FF4B4B?style=for-the-badge)](https://duckdb-executive-analytics-claramtenorio.streamlit.app/)
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "data" / "gold" / "olist_analytics.duckdb"
 
-![Python](https://img.shields.io/badge/Python-3.11+-blue?logo=python&logoColor=white)
-![DuckDB](https://img.shields.io/badge/DuckDB-OLAP_Engine-FFF000?logo=duckdb&logoColor=black)
-![Apache Parquet](https://img.shields.io/badge/PyArrow-Parquet-orange?logo=apacheparquet&logoColor=white)
-![Streamlit](https://img.shields.io/badge/Streamlit-Executive_App-FF4B4B?logo=streamlit&logoColor=white)
+st.set_page_config(
+    page_title="Olist Executive Lakehouse | DuckDB + Medallion",
+    page_icon="📊",
+    layout="wide",
+)
 
-An end-to-end **Medallion Architecture Data Pipeline (`Bronze → Silver → Gold`)** and **Interactive Executive Analytics Suite** built on **1.5M+ real Brazilian E-Commerce and B2B Marketing Funnel records**.
 
-🔗 **Live Interactive Application:** **[duckdb-executive-analytics-claramtenorio.streamlit.app](https://duckdb-executive-analytics-claramtenorio.streamlit.app/)**
+@st.cache_resource
+def get_connection() -> duckdb.DuckDBPyConnection:
+    if DB_PATH.exists():
+        return duckdb.connect(str(DB_PATH), read_only=True)
 
-Unlike standard exploratory notebooks, this project focuses on **production-grade data engineering**: strict grain enforcement, zero-copy Parquet processing, mathematical prevention of SQL fan-out traps, geospatial feature engineering, and sub-second OLAP execution powered by **DuckDB**.
+    # Cloud Deployment Fallback: mount Gold Parquet files directly into in-memory DuckDB
+    gold_dir = BASE_DIR / "data" / "gold"
+    parquet_files = list(gold_dir.glob("*.parquet"))
+    if not parquet_files:
+        st.error("Gold layer data not found! Please run `python3 run_pipeline.py` first.")
+        st.stop()
 
----
+    con = duckdb.connect(":memory:")
+    for pq_file in parquet_files:
+        table_name = pq_file.stem
+        con.execute(f"CREATE VIEW {table_name} AS SELECT * FROM '{pq_file}';")
+    return con
 
-## System Architecture (Medallion Pattern)
 
-```text
-+-----------------------------------------------------------------------------------+
-| BRONZE LAYER (Raw Ingestion - 11 CSV Files | ~1.55M Rows | ~126 MB)               |
-| Raw e-commerce transactions, reviews, 1M+ GPS coordinates, and B2B funnel leads.  |
-+-----------------------------------------------------------------------------------+
-                                         |
-                                         v  [src/etl/transform_silver.py]
-+-----------------------------------------------------------------------------------+
-| SILVER LAYER (Cleaned, Deduplicated & Enriched - 10 Parquet Files | PyArrow)      |
-| • Geolocation deduplication: 1,000,163 rows -> 19,011 unique ZIPs (99% smaller)   |
-| • Date-truncation SLA fix: corrected 1,292 false-positive late delivery flags     |
-| • Strict 1:1 grain deduplication on reviews & hierarchical median imputation      |
-+-----------------------------------------------------------------------------------+
-                                         |
-                                         v  [src/etl/build_gold.py]
-+-----------------------------------------------------------------------------------+
-| GOLD LAYER (Dimensional Star Schema - DuckDB OLAP Engine & Gold Parquet)          |
-| • Pre-aggregated CTEs guaranteeing 0.00% financial Fan-Out across 1:N joins       |
-| • Geospatial Haversine distance (km) computed in vectorized SQL                   |
-| • End-to-end B2B-to-B2C lineage (Marketing Leads -> Closed Deals -> Seller GMV)   |
-+-----------------------------------------------------------------------------------+
-                                         |
-                                         v  [app.py & src/analytics/executive_kpis.py]
-+-----------------------------------------------------------------------------------+
-| CONSUMPTION LAYER (Streamlit Executive Dashboard + Live DuckDB SQL Workbench)     |
-+-----------------------------------------------------------------------------------+
-```
+con = get_connection()
 
----
+# --- SIDEBAR FILTERS ---
+st.sidebar.title("🎛️ Executive Filters")
+st.sidebar.markdown("Filter the **Gold Layer** in real time powered by **DuckDB OLAP**.")
 
-## Data Engineering & Quality Audits (`src/etl/audit_anomalies.py`)
+min_date, max_date = con.execute(
+    "SELECT MIN(order_purchase_timestamp)::DATE, MAX(order_purchase_timestamp)::DATE FROM fact_orders WHERE order_status = 'delivered'"
+).fetchone()
 
-Before modeling the Gold layer, automated audits uncovered critical anomalies in the raw dataset that distort standard analyses:
+date_range = st.sidebar.date_input(
+    "Order Date Range",
+    value=(pd.to_datetime("2017-01-01").date(), max_date),
+    min_value=min_date,
+    max_value=max_date,
+)
 
-### 1. Eliminating the R$ 4.3M SQL Fan-Out Trap
-Joining `order_items` (`1:N`) directly with `payments` (`1:N`) on `order_id` creates a Cartesian product on multi-item, multi-payment orders. Our DuckDB audit quantified the exact distortion:
+all_states = [
+    r[0]
+    for r in con.execute(
+        "SELECT DISTINCT customer_state FROM fact_orders WHERE customer_state IS NOT NULL ORDER BY 1"
+    ).fetchall()
+]
+selected_states = st.sidebar.multiselect("Customer States (UF)", options=all_states, default=[])
 
-| Metric | True Isolated Value | Naive `JOIN` Value (Fan-Out) | Artificial Distortion |
-| :--- | :---: | :---: | :---: |
-| **Merchandise GMV (`order_items`)** | `R$ 15,843,553.24` | `R$ 16,566,543.85` | **+R$ 722,990.61 (Fake GMV)** |
-| **Total Paid (`payments`)** | `R$ 16,008,872.12` | `R$ 20,308,134.71` | **+R$ 4,299,262.59 (+26.8% Error)** |
+if len(date_range) == 2:
+    start_dt, end_dt = date_range
+else:
+    start_dt, end_dt = min_date, max_date
 
-* **Engineering Solution:** In `build_gold.py`, both `order_items` and `payments` are pre-aggregated to strict `1:1` `order_id` grain inside Common Table Expressions (`CTEs`) prior to joining into `fact_orders`, achieving **to-the-cent financial reconciliation**.
+state_filter_sql = ""
+if selected_states:
+    states_str = ", ".join(f"'{s}'" for s in selected_states)
+    state_filter_sql = f" AND customer_state IN ({states_str})"
 
-### 2. Fixing the `00:00:00` Timestamp SLA Trap
-* `order_estimated_delivery_date` is stored at midnight (`00:00:00`), whereas `order_delivered_customer_date` includes exact hours and minutes.
-* A naive timestamp comparison (`delivered > estimated`) falsely flags **7,827 orders (8.11%)** as late—including orders delivered *on the promised date* at `14:30`.
-* **Engineering Solution:** Normalizing both timestamps to calendar days (`dt.normalize()`) revealed that **1,292 orders were false positives**, bringing the true late delivery rate to **6.77% (6,535 orders)**.
+st.sidebar.markdown("---")
+st.sidebar.caption("Architecture: **Bronze (CSV) → Silver (Parquet) → Gold (DuckDB)**")
 
-### 3. Preserving Revenue While Flagging Chronological Corruption
-* **189 delivered orders** exhibit impossible logistics timestamps (e.g., `delivered_customer_date < delivered_carrier_date` or `carrier_date < purchase_timestamp`).
-* Rather than dropping these rows and destroying valid financial GMV, the Silver layer isolates them with `has_chronological_error = True` so financial totals remain intact while SLA distributions remain uncorrupted.
+# --- HEADER ---
+st.title("📊 Olist Executive Analytics & Medallion Lakehouse")
+st.markdown(
+    "Real-time OLAP intelligence built on **1.5M+ Brazilian E-Commerce & B2B Funnel records** using **Python, PyArrow, and DuckDB**."
+)
 
-### 4. Geospatial Compression & Bounding-Box Filtering
-* Filtered out **31 invalid GPS coordinates** located outside Brazil's geographic bounding box (ocean/hemisphere errors) and compressed `1,000,163` raw coordinate logs into **`19,011` unique 5-digit ZIP code prefixes** (`58 MB CSV → 551 KB Parquet`).
+# --- TOP KPI CARDS ---
+kpi_query = f"""
+    SELECT
+        COUNT(DISTINCT order_id) AS total_orders,
+        ROUND(SUM(gmv_total), 2) AS total_gmv,
+        ROUND(SUM(paid_total), 2) AS total_paid,
+        ROUND(AVG(gmv_total), 2) AS avg_ticket,
+        ROUND(100.0 * COUNT(*) FILTER (WHERE is_late) / NULLIF(COUNT(*) FILTER (WHERE order_status = 'delivered'), 0), 2) AS late_rate_pct,
+        ROUND(AVG(review_score), 2) AS avg_nps_score
+    FROM fact_orders
+    WHERE order_purchase_timestamp::DATE BETWEEN '{start_dt}' AND '{end_dt}'
+    {state_filter_sql}
+"""
+kpis = con.execute(kpi_query).fetchone()
 
----
 
-## Key Executive Business Insights (`src/analytics/executive_kpis.py`)
+def fmt_brl(val: float) -> str:
+    if val is None:
+        return "R$ 0.00"
+    if abs(val) >= 1_000_000:
+        return f"R$ {val / 1_000_000:.2f}M"
+    if abs(val) >= 10_000:
+        return f"R$ {val / 1_000:.1f}K"
+    return f"R$ {val:,.2f}"
 
-1. **The Cost of Broken SLAs on Customer Retention:**
-   * **On-Time Deliveries (avg 11.0 days):** Achieve a **4.29 ⭐** average rating with only **6.6%** 1-star reviews.
-   * **Late Deliveries (avg 33.8 days):** Rating collapses to **2.27 ⭐**, and **53.8% of all reviews become 1-star** (an **8.1x surge** in severe dissatisfaction).
-2. **Regional Last-Mile Bottlenecks (RJ vs. MG & Northeast):**
-   * Despite similar average shipping distances from sellers (~500 km) and comparable GMV (~R$ 1.8M–2.0M), **Rio de Janeiro (`RJ`) suffers a 12.1% late delivery rate**—nearly **3x higher than Minas Gerais (`MG` at 4.6%)**.
-   * **Bahia (`BA`)** faces an average shipping distance of **1,345 km**, pushing freight costs to **24.9% of total order value** and late rates to **12.2%**, highlighting the ROI of decentralizing fulfillment hubs to the Northeast.
-3. **B2B Seller Funnel Activation Leakage:**
-   * Across **8,000 Marketing Qualified Leads (MQLs)** and **842 Closed Deals**, less than **45% of signed sellers ever generate their first sale** on the marketplace (e.g., `organic_search` converts 271 deals, but only 113 become active revenue-generating sellers).
-   * `paid_search` delivers **3x higher realized GMV per lead (`R$ 114.75`)** than `social` (`R$ 38.05`).
-4. **Category Pareto Concentration (80/20 Rule):**
-   * Out of 74 product categories, just **17 categories (23% of the catalog)** drive **79.81% of total marketplace GMV**, led by `health_beauty`, `watches_gifts`, and `bed_bath_table`.
 
----
+row1_col1, row1_col2, row1_col3 = st.columns(3)
+row2_col1, row2_col2, row2_col3 = st.columns(3)
+row1_col1.metric("Total Orders", f"{kpis[0]:,}")
+row1_col2.metric("Merchandise GMV", fmt_brl(kpis[1]), help=f"Exact GMV: R$ {kpis[1]:,.2f}")
+row1_col3.metric("Total Paid (w/ Interest)", fmt_brl(kpis[2]), help=f"Exact Paid: R$ {kpis[2]:,.2f}")
+row2_col1.metric("Average Order Ticket", f"R$ {kpis[3]:,.2f}")
+row2_col2.metric("Late Delivery SLA", f"{kpis[4] or 0:.2f}%")
+row2_col3.metric("Avg Customer Rating", f"{kpis[5] or 0:.2f} ⭐")
 
-## End-to-End Pipeline Performance
+st.markdown("---")
 
-Executed on Apple Silicon via `python3 run_pipeline.py`:
+# --- TABS ---
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    [
+        "📈 Revenue & Growth",
+        "🚚 Logistics & SLA Impact",
+        "🤝 B2B Marketing Funnel",
+        "📦 Category Pareto (80/20)",
+        "💻 DuckDB SQL Workbench",
+    ]
+)
 
-| Pipeline Stage | Engine | Execution Time | Share |
-| :--- | :--- | :---: | :---: |
-| **1. Silver Layer Transformation (CSV → Parquet)** | `Pandas / PyArrow` | `3.34s` | `61.5%` |
-| **2. Data Quality & Anomaly Audits** | `Pandas / DuckDB` | `0.97s` | `17.9%` |
-| **3. Gold Layer Star Schema Build (5 Tables + Haversine)** | `DuckDB SQL` | `1.06s` | `19.5%` |
-| **4. Executive Analytics & KPI Reporting (4 Complex Queries)** | `DuckDB SQL` | `0.06s` | `1.1%` |
-| **TOTAL END-TO-END EXECUTION** | **Hybrid Lakehouse** | **`5.43s`** | **`100%`** |
+with tab1:
+    st.subheader("Monthly GMV Evolution vs. Late Delivery Rate")
+    q_monthly = f"""
+        SELECT
+            STRFTIME(order_month, '%Y-%m') AS year_month,
+            COUNT(DISTINCT order_id) AS orders,
+            ROUND(SUM(gmv_total), 2) AS gmv,
+            ROUND(100.0 * COUNT(*) FILTER (WHERE is_late) / NULLIF(COUNT(*) FILTER (WHERE order_status = 'delivered'), 0), 2) AS late_rate_pct
+        FROM fact_orders
+        WHERE order_purchase_timestamp::DATE BETWEEN '{start_dt}' AND '{end_dt}'
+          AND order_status = 'delivered'
+          {state_filter_sql}
+        GROUP BY 1
+        ORDER BY 1
+    """
+    df_monthly = con.execute(q_monthly).df()
 
----
+    fig_trend = go.Figure()
+    fig_trend.add_trace(
+        go.Bar(x=df_monthly["year_month"], y=df_monthly["gmv"], name="GMV (R$)", marker_color="#2563eb")
+    )
+    fig_trend.add_trace(
+        go.Scatter(
+            x=df_monthly["year_month"],
+            y=df_monthly["late_rate_pct"],
+            name="Late Rate (%)",
+            yaxis="y2",
+            mode="lines+markers",
+            line=dict(color="#dc2626", width=3),
+        )
+    )
+    fig_trend.update_layout(
+        yaxis=dict(title="Total GMV (R$)"),
+        yaxis2=dict(title="Late Delivery Rate (%)", overlaying="y", side="right"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        height=440,
+    )
+    st.plotly_chart(fig_trend, use_container_width=True)
 
-## How to Run Locally
+with tab2:
+    c_left, c_right = st.columns(2)
 
-### 1. Clone the repository & install dependencies
-```bash
-git clone [https://github.com/claramtenorio/duckdb-executive-analytics.git](https://github.com/claramtenorio/duckdb-executive-analytics.git)
-cd duckdb-executive-analytics
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
+    with c_left:
+        st.subheader("SLA Delay Impact on Review Scores")
+        q_sla = f"""
+            SELECT
+                CASE WHEN is_late THEN 'Late Delivery' ELSE 'On-Time Delivery' END AS sla_status,
+                ROUND(AVG(review_score), 2) AS avg_score,
+                ROUND(100.0 * COUNT(*) FILTER (WHERE review_score = 1) / COUNT(review_score), 1) AS pct_1_star,
+                ROUND(AVG(actual_delivery_days), 1) AS avg_days
+            FROM fact_orders
+            WHERE order_status = 'delivered'
+              AND review_score IS NOT NULL
+              AND order_purchase_timestamp::DATE BETWEEN '{start_dt}' AND '{end_dt}'
+              {state_filter_sql}
+            GROUP BY 1
+        """
+        df_sla = con.execute(q_sla).df()
+        fig_sla = px.bar(
+            df_sla,
+            x="sla_status",
+            y=["avg_score", "pct_1_star"],
+            barmode="group",
+            title="Avg Star Rating vs. % of 1-Star Reviews by SLA Status",
+            labels={"value": "Metric Value", "sla_status": "Delivery Status"},
+        )
+        st.plotly_chart(fig_sla, use_container_width=True)
+        st.dataframe(df_sla, use_container_width=True, hide_index=True)
 
-### 2. Place raw CSV files in `data/bronze/`
-Download the [Brazilian E-Commerce Public Dataset by Olist](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce) and the [Marketing Funnel by Olist](https://www.kaggle.com/datasets/olistbr/marketing-funnel-olist) and place all 11 CSV files inside `data/bronze/`.
+    with c_right:
+        st.subheader("Regional Logistics: Haversine Distance vs. SLA")
+        q_states = f"""
+            SELECT
+                customer_state AS state,
+                COUNT(DISTINCT order_id) AS orders,
+                ROUND(SUM(total_item_value), 2) AS gmv,
+                ROUND(AVG(shipping_distance_km), 0) AS avg_distance_km,
+                ROUND(100.0 * AVG(freight_share), 1) AS freight_share_pct,
+                ROUND(100.0 * COUNT(DISTINCT order_id) FILTER (WHERE is_late) / COUNT(DISTINCT order_id), 1) AS late_rate_pct
+            FROM fact_order_items
+            WHERE order_status = 'delivered'
+              AND order_purchase_timestamp::DATE BETWEEN '{start_dt}' AND '{end_dt}'
+              {state_filter_sql}
+            GROUP BY 1
+            HAVING COUNT(DISTINCT order_id) >= 100
+            ORDER BY gmv DESC
+        """
+        df_states = con.execute(q_states).df()
+        fig_scatter = px.scatter(
+            df_states,
+            x="avg_distance_km",
+            y="late_rate_pct",
+            size="gmv",
+            color="freight_share_pct",
+            hover_name="state",
+            text="state",
+            title="State Distance (km) vs. Late Rate (%) — Bubble Size = GMV",
+            labels={
+                "avg_distance_km": "Avg Seller-to-Customer Distance (km)",
+                "late_rate_pct": "Late Delivery Rate (%)",
+                "freight_share_pct": "Freight % of Order",
+            },
+        )
+        fig_scatter.update_traces(textposition="top center")
+        st.plotly_chart(fig_scatter, use_container_width=True)
 
-### 3. Run the End-to-End Medallion Pipeline
-```bash
-python3 run_pipeline.py
-```
+with tab3:
+    st.subheader("B2B Seller Acquisition Funnel & Realized Marketplace GMV")
+    q_b2b = """
+        SELECT
+            origin AS acquisition_channel,
+            COUNT(*) AS mql_leads,
+            COUNT(*) FILTER (WHERE is_converted) AS closed_deals,
+            COUNT(*) FILTER (WHERE realized_gmv > 0) AS active_generating_sellers,
+            ROUND(100.0 * COUNT(*) FILTER (WHERE is_converted) / COUNT(*), 1) AS lead_to_deal_pct,
+            ROUND(100.0 * COUNT(*) FILTER (WHERE realized_gmv > 0) / NULLIF(COUNT(*) FILTER (WHERE is_converted), 0), 1) AS deal_activation_pct,
+            ROUND(SUM(realized_gmv), 2) AS realized_gmv,
+            ROUND(SUM(realized_gmv) / COUNT(*), 2) AS gmv_per_lead
+        FROM fact_b2b_funnel
+        GROUP BY 1
+        HAVING COUNT(*) >= 100
+        ORDER BY realized_gmv DESC
+    """
+    df_b2b = con.execute(q_b2b).df()
 
-### 4. Launch the Interactive Executive Dashboard
-```bash
-streamlit run app.py
-```
+    b_left, b_right = st.columns(2)
+    with b_left:
+        fig_b2b = px.bar(
+            df_b2b,
+            x="acquisition_channel",
+            y="realized_gmv",
+            color="gmv_per_lead",
+            title="Realized Marketplace GMV by B2B Marketing Channel",
+            labels={"realized_gmv": "Realized Seller GMV (R$)", "acquisition_channel": "Marketing Origin"},
+        )
+        st.plotly_chart(fig_b2b, use_container_width=True)
+    with b_right:
+        fig_conv = px.bar(
+            df_b2b,
+            x="acquisition_channel",
+            y=["mql_leads", "closed_deals", "active_generating_sellers"],
+            barmode="group",
+            title="Funnel Leakage: Leads → Closed Deals → Active Sellers",
+        )
+        st.plotly_chart(fig_conv, use_container_width=True)
 
----
+    st.dataframe(df_b2b, use_container_width=True, hide_index=True)
 
-## Repository Structure
+with tab4:
+    st.subheader("Product Category Pareto (80/20 Concentration)")
+    q_pareto = f"""
+        WITH cat_gmv AS (
+            SELECT
+                category_en,
+                COUNT(DISTINCT order_id) AS orders,
+                ROUND(SUM(total_item_value), 2) AS gmv
+            FROM fact_order_items
+            WHERE order_status NOT IN ('canceled', 'unavailable')
+              AND order_purchase_timestamp::DATE BETWEEN '{start_dt}' AND '{end_dt}'
+              {state_filter_sql}
+            GROUP BY 1
+        )
+        SELECT
+            category_en,
+            orders,
+            gmv,
+            ROUND(100.0 * gmv / SUM(gmv) OVER (), 2) AS share_pct,
+            ROUND(100.0 * SUM(gmv) OVER (ORDER BY gmv DESC) / SUM(gmv) OVER (), 2) AS cumulative_pct
+        FROM cat_gmv
+        ORDER BY gmv DESC
+        LIMIT 25
+    """
+    df_pareto = con.execute(q_pareto).df()
 
-```text
-duckdb-executive-analytics/
-├── app.py                          # Streamlit Executive Dashboard & Live DuckDB SQL Workbench
-├── run_pipeline.py                 # End-to-end pipeline orchestrator with execution profiler
-├── requirements.txt                # Project dependencies
-├── data/
-│   ├── bronze/                     # Raw CSV datasets (git-ignored)
-│   ├── silver/                     # Cleaned & deduplicated Parquet files (git-ignored)
-│   └── gold/                       # DuckDB OLAP database & Star Schema Parquets
-└── src/
-    ├── etl/
-    │   ├── profile_bronze.py       # Automated raw data profiling & schema inspection
-    │   ├── audit_anomalies.py      # SLA, chronology, geospatial & SQL fan-out audits
-    │   ├── transform_silver.py     # Silver layer cleaning, normalization & Parquet export
-    │   └── build_gold.py           # Gold Star Schema modeling in DuckDB SQL
-    └── analytics/
-        └── executive_kpis.py       # Strategic business KPI suite in DuckDB SQL
-```
+    fig_p = go.Figure()
+    fig_p.add_trace(go.Bar(x=df_pareto["category_en"], y=df_pareto["gmv"], name="Category GMV (R$)"))
+    fig_p.add_trace(
+        go.Scatter(
+            x=df_pareto["category_en"],
+            y=df_pareto["cumulative_pct"],
+            name="Cumulative Share (%)",
+            yaxis="y2",
+            mode="lines+markers",
+            line=dict(color="#16a34a", width=3),
+        )
+    )
+    fig_p.update_layout(
+        yaxis=dict(title="GMV (R$)"),
+        yaxis2=dict(title="Cumulative Share (%)", overlaying="y", side="right", range=[0, 105]),
+        height=450,
+    )
+    st.plotly_chart(fig_p, use_container_width=True)
+    st.dataframe(df_pareto, use_container_width=True, hide_index=True)
+
+with tab5:
+    st.subheader("💻 Interactive DuckDB SQL Workbench (Gold Layer)")
+    st.markdown(
+        "Run custom analytical SQL queries directly against `fact_orders`, `fact_order_items`, `fact_b2b_funnel`, `dim_products`, and `dim_sellers`."
+    )
+    default_sql = """SELECT 
+    primary_payment_type,
+    COUNT(*) AS orders,
+    ROUND(AVG(max_installments), 1) AS avg_installments,
+    ROUND(SUM(gmv_total), 2) AS total_gmv,
+    ROUND(SUM(paid_total), 2) AS total_paid,
+    ROUND(SUM(financing_spread), 2) AS total_financing_spread
+FROM fact_orders
+WHERE order_status = 'delivered'
+GROUP BY 1
+ORDER BY total_paid DESC;"""
+
+    user_sql = st.text_area("SQL Query", value=default_sql, height=180)
+    if st.button("▶️ Execute Query on DuckDB"):
+        try:
+            res_df = con.execute(user_sql).df()
+            st.success(f"Returned {len(res_df):,} rows.")
+            st.dataframe(res_df, use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.error(f"SQL Error: {e}")
