@@ -1,5 +1,6 @@
 from pathlib import Path
 import pandas as pd
+import duckdb
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 BRONZE_DIR = BASE_DIR / "data" / "bronze"
@@ -82,9 +83,36 @@ def audit_geolocation_anomalies() -> None:
     print(f"  - Invalid Latitude (outside BR): {invalid_lat:,}")
     print(f"  - Invalid Longitude (outside BR): {invalid_lng:,}")
 
+
+def audit_fanout_trap() -> None:
+    silver_dir = BASE_DIR / "data" / "silver"
+    con = duckdb.connect()
+
+    # Naive JOIN between order_items (1:N) and payments (1:N) without pre-aggregation
+    naive_query = f"""
+        SELECT 
+            COUNT(*) AS joined_rows,
+            SUM(oi.total_item_value) AS inflated_gmv,
+            SUM(p.payment_value) AS inflated_paid
+        FROM '{silver_dir}/order_items.parquet' oi
+        JOIN '{silver_dir}/payments.parquet' p USING (order_id)
+    """
+    joined_rows, inflated_gmv, inflated_paid = con.execute(naive_query).fetchone()
+
+    # True totals from isolated tables
+    true_gmv = con.execute(f"SELECT SUM(total_item_value) FROM '{silver_dir}/order_items.parquet'").fetchone()[0]
+    true_paid = con.execute(f"SELECT SUM(payment_value) FROM '{silver_dir}/payments.parquet'").fetchone()[0]
+
+    print("\n=== 5. SQL FAN-OUT TRAP AUDIT (DUCKDB) ===")
+    print(f"  - True GMV (order_items)       : R$ {true_gmv:>13,.2f}")
+    print(f"  - Naive Joined GMV (Fan-Out!)  : R$ {inflated_gmv:>13,.2f} (+R$ {inflated_gmv - true_gmv:,.2f} fake revenue!)")
+    print(f"  - True Paid (payments)         : R$ {true_paid:>13,.2f}")
+    print(f"  - Naive Joined Paid (Fan-Out!) : R$ {inflated_paid:>13,.2f} (+R$ {inflated_paid - true_paid:,.2f} fake paid!)")
+
     
 if __name__ == "__main__":
     audit_orders_anomalies()
     audit_products_anomalies()
     audit_reviews_anomalies()
     audit_geolocation_anomalies()
+    audit_fanout_trap()
