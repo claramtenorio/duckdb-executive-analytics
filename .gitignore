@@ -17,5 +17,26 @@ data/bronze/*
 data/silver/*
 !data/silver/.gitkeep
 
-data/gold/*
+# Virtual environment & Python cache
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Environment variables & secrets (API Keys)
+.env
+
+# macOS system files
+.DS_Store
+
+# Data files (ignore raw CSVs, Silver Parquets, and local DuckDB binary)
+data/bronze/*
+!data/bronze/.gitkeep
+
+data/silver/*
+!data/silver/.gitkeep
+
+data/gold/*.duckdb
+data/gold/*.duckdb.wal
 !data/gold/.gitkeep
+!data/gold/*.parquet

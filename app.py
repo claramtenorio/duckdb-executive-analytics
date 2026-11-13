@@ -17,10 +17,21 @@ st.set_page_config(
 
 @st.cache_resource
 def get_connection() -> duckdb.DuckDBPyConnection:
-    if not DB_PATH.exists():
-        st.error("Gold DuckDB database not found! Please run `python3 run_pipeline.py` first.")
+    if DB_PATH.exists():
+        return duckdb.connect(str(DB_PATH), read_only=True)
+
+    # Cloud Deployment Fallback: mount Gold Parquet files directly into in-memory DuckDB
+    gold_dir = BASE_DIR / "data" / "gold"
+    parquet_files = list(gold_dir.glob("*.parquet"))
+    if not parquet_files:
+        st.error("Gold layer data not found! Please run `python3 run_pipeline.py` first.")
         st.stop()
-    return duckdb.connect(str(DB_PATH), read_only=True)
+
+    con = duckdb.connect(":memory:")
+    for pq_file in parquet_files:
+        table_name = pq_file.stem
+        con.execute(f"CREATE VIEW {table_name} AS SELECT * FROM '{pq_file}';")
+    return con
 
 
 con = get_connection()
